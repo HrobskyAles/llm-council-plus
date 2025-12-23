@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Router type: 'openrouter' or 'ollama'
+# Router type: 'openrouter', 'ollama', or 'llamacpp'
 ROUTER_TYPE = os.getenv("ROUTER_TYPE", "openrouter").lower()
 
 # OpenRouter settings
@@ -17,6 +17,9 @@ OPENROUTER_API_URL = os.getenv(
 
 # Ollama settings
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "localhost:11434")
+
+# Llama.cpp server settings
+LLAMACPP_HOST = os.getenv("LLAMACPP_HOST", "localhost:8080")
 
 # Council members - list of model identifiers
 # Parse from comma-separated string or use default
@@ -31,6 +34,13 @@ else:
             "llama3.1:latest",
             "qwen3:latest",
             "gemma3:latest",
+        ]
+    elif ROUTER_TYPE == "llamacpp":
+        COUNCIL_MODELS = [
+            "llama3.1",
+            "qwen3",
+            "mistral",
+            "gemma3",
         ]
     else:
         COUNCIL_MODELS = [
@@ -49,6 +59,8 @@ if not CHAIRMAN_MODEL:
     # Default chairman model based on router type
     if ROUTER_TYPE == "ollama":
         CHAIRMAN_MODEL = "gemma3:latest"
+    elif ROUTER_TYPE == "llamacpp":
+        CHAIRMAN_MODEL = "llama3.1"
     else:
         CHAIRMAN_MODEL = "google/gemini-3-pro-preview"
 
@@ -86,9 +98,9 @@ GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv(
 GOOGLE_DRIVE_ENABLED = bool(GOOGLE_DRIVE_FOLDER_ID)
 
 # Validate router type at import time (safe)
-if ROUTER_TYPE not in ["openrouter", "ollama"]:
+if ROUTER_TYPE not in ["openrouter", "ollama", "llamacpp"]:
     raise ValueError(
-        f"Invalid ROUTER_TYPE: {ROUTER_TYPE}. Must be 'openrouter' or 'ollama'"
+        f"Invalid ROUTER_TYPE: {ROUTER_TYPE}. Must be 'openrouter', 'ollama', or 'llamacpp'"
     )
 
 
@@ -112,7 +124,7 @@ def reload_config():
     Call this after updating .env via setup wizard.
     """
     global ROUTER_TYPE, OPENROUTER_API_KEY, OPENROUTER_API_URL
-    global OLLAMA_HOST, COUNCIL_MODELS, CHAIRMAN_MODEL
+    global OLLAMA_HOST, LLAMACPP_HOST, COUNCIL_MODELS, CHAIRMAN_MODEL
     global AUTH_ENABLED, ENABLE_TAVILY, TAVILY_API_KEY
     global ENABLE_EXA, EXA_API_KEY
     global ENABLE_OPENAI_EMBEDDINGS, OPENAI_API_KEY
@@ -137,6 +149,9 @@ def reload_config():
     # Ollama settings
     OLLAMA_HOST = os.getenv("OLLAMA_HOST", "localhost:11434")
 
+    # Llama.cpp server settings
+    LLAMACPP_HOST = os.getenv("LLAMACPP_HOST", "localhost:8080")
+
     # Council members
     council_models_str = os.getenv("COUNCIL_MODELS")
     if council_models_str:
@@ -148,6 +163,13 @@ def reload_config():
                 "llama3.1:latest",
                 "qwen3:latest",
                 "gemma3:latest",
+            ]
+        elif ROUTER_TYPE == "llamacpp":
+            COUNCIL_MODELS = [
+                "llama3.1",
+                "qwen3",
+                "mistral",
+                "gemma3",
             ]
         else:
             COUNCIL_MODELS = [
@@ -164,6 +186,8 @@ def reload_config():
     if not CHAIRMAN_MODEL:
         if ROUTER_TYPE == "ollama":
             CHAIRMAN_MODEL = "gemma3:latest"
+        elif ROUTER_TYPE == "llamacpp":
+            CHAIRMAN_MODEL = "llama3.1"
         else:
             CHAIRMAN_MODEL = "google/gemini-3-pro-preview"
 

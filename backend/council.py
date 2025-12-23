@@ -109,6 +109,8 @@ if ROUTER_TYPE == "ollama":
             # Ollama may not support images, return text only with warning
             logger.warning("Ollama router may not support image attachments. Images ignored.")
         return text
+elif ROUTER_TYPE == "llamacpp":
+    from .llamacpp import query_models_parallel, query_model, query_models_streaming, build_message_content
 elif ROUTER_TYPE == "openrouter":
     from .openrouter import query_models_parallel, query_model, query_models_streaming, build_message_content
 else:
