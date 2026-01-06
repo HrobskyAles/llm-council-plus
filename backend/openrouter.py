@@ -258,3 +258,132 @@ async def query_models_streaming(
         yield_time = time.time() - start_time
         logger.debug("[PARALLEL] Yielding %s at t=%.2fs", model, yield_time)
         yield (model, response)
+
+
+async def query_models_with_stage_timeout(
+    models: List[str],
+    messages: List[Dict[str, Any]],
+    stage: str = None,
+    stage_timeout: float = 90.0,
+    min_results: int = 3
+) -> Dict[str, Optional[Dict[str, Any]]]:
+    """
+    Query multiple models in parallel with overall stage timeout.
+
+    Uses first-N-complete pattern: returns when either:
+    - All models complete
+    - stage_timeout is reached (returns completed results)
+    - min_results are collected AND timeout reached
+
+    This prevents slow models from blocking the entire stage.
+
+    Args:
+        models: List of OpenRouter model identifiers
+        messages: List of message dicts to send to each model
+        stage: Optional stage identifier for debugging
+        stage_timeout: Maximum time to wait for this stage (seconds)
+        min_results: Minimum number of results to wait for before timeout applies
+
+    Returns:
+        Dict mapping model identifier to response dict
+    """
+    import asyncio
+    import time
+
+    start_time = time.time()
+    results = {}
+
+    if stage:
+        logger.info("[%s] Starting with stage_timeout=%.1fs, min_results=%d",
+                   stage, stage_timeout, min_results)
+
+    # Create named tasks
+    async def query_with_name(model: str):
+        response = await query_model(model, messages, stage=stage)
+        return (model, response)
+
+    # Create ALL tasks at once
+    tasks = {asyncio.create_task(query_with_name(model)): model for model in models}
+    pending = set(tasks.keys())
+
+    extended_wait_used = False  # Track if we've already done the extended wait
+
+    while pending:
+        elapsed = time.time() - start_time
+        remaining_timeout = stage_timeout - elapsed
+
+        # Check if we should stop waiting
+        if remaining_timeout <= 0:
+            if len(results) >= min_results:
+                logger.warning("[%s] Stage timeout reached after %.1fs with %d/%d results, proceeding",
+                             stage, elapsed, len(results), len(models))
+                # Cancel remaining tasks
+                for task in pending:
+                    task.cancel()
+                break
+            elif not extended_wait_used:
+                # Not enough results, wait a bit more (up to 30s extra) - but only once
+                extended_wait_used = True
+                remaining_timeout = min(30.0, stage_timeout * 0.5)
+                logger.warning("[%s] Only %d results after timeout, waiting %.1fs more for min_results=%d",
+                             stage, len(results), remaining_timeout, min_results)
+            else:
+                # Extended wait already used, give up and return what we have
+                logger.warning("[%s] Extended wait exhausted after %.1fs with only %d/%d results, proceeding anyway",
+                             stage, elapsed, len(results), len(models))
+                for task in pending:
+                    task.cancel()
+                break
+
+        try:
+            # Wait for next task to complete
+            done, pending = await asyncio.wait(
+                pending,
+                timeout=remaining_timeout,
+                return_when=asyncio.FIRST_COMPLETED
+            )
+
+            for task in done:
+                try:
+                    model, response = task.result()
+                    results[model] = response
+                    logger.debug("[%s] Got result from %s at t=%.2fs (%d/%d)",
+                               stage, model, time.time() - start_time, len(results), len(models))
+                except Exception as e:
+                    model = tasks[task]
+                    logger.error("[%s] Task for %s failed: %s", stage, model, e)
+                    results[model] = {
+                        'error': True,
+                        'error_type': 'unknown',
+                        'error_message': str(e)
+                    }
+
+            if not done and not pending:
+                break
+
+        except asyncio.TimeoutError:
+            # Timeout waiting for next result
+            if len(results) >= min_results:
+                logger.warning("[%s] Timeout with %d/%d results, proceeding",
+                             stage, len(results), len(models))
+                for task in pending:
+                    task.cancel()
+                break
+
+    # Add timeout entries for models that didn't complete
+    completed_models = set(results.keys())
+    for model in models:
+        if model not in completed_models:
+            results[model] = {
+                'error': True,
+                'error_type': 'stage_timeout',
+                'error_message': f'Model did not respond within stage timeout ({stage_timeout}s)'
+            }
+            logger.warning("[%s] Model %s timed out at stage level", stage, model)
+
+    total_time = time.time() - start_time
+    success_count = sum(1 for r in results.values() if r and not r.get('error'))
+    logger.info("[%s] Completed in %.2fs: %d success, %d failed/timeout",
+               stage, total_time, success_count, len(models) - success_count)
+
+    return results

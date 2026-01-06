@@ -1,8 +1,9 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import PropTypes from 'prop-types';
 import { api } from '../api';
 import { useAuthStore } from '../store/authStore';
+import { formatRelativeDate } from '../utils/timing';
 import './Sidebar.css';
 
 export default function Sidebar({
@@ -18,18 +19,36 @@ export default function Sidebar({
   const [version, setVersion] = useState('');
   const [users, setUsers] = useState(['All']);
   const [userFilter, setUserFilter] = useState('All');
+  const [searchQuery, setSearchQuery] = useState('');
   const [editingId, setEditingId] = useState(null);
   const [editTitle, setEditTitle] = useState('');
   const [menuOpenId, setMenuOpenId] = useState(null);
   const [menuPosition, setMenuPosition] = useState({ top: 0, left: 0 });
   const menuButtonRefs = useRef({});
+  const searchInputRef = useRef(null);
 
   // Auth state
   const { username, logout, isAuthenticated } = useAuthStore();
 
-  const filteredConversations = userFilter === 'All'
-    ? conversations
-    : conversations.filter(conv => conv.username === userFilter);
+  // Filter conversations by user and search query
+  const filteredConversations = useMemo(() => {
+    let result = conversations;
+
+    // Filter by user
+    if (userFilter !== 'All') {
+      result = result.filter(conv => conv.username === userFilter);
+    }
+
+    // Filter by search query
+    if (searchQuery.trim()) {
+      const query = searchQuery.toLowerCase().trim();
+      result = result.filter(conv =>
+        (conv.title || '').toLowerCase().includes(query)
+      );
+    }
+
+    return result;
+  }, [conversations, userFilter, searchQuery]);
 
   useEffect(() => {
     api.getVersion().then(({ version }) => setVersion(version));
@@ -163,6 +182,30 @@ export default function Sidebar({
           </button>
         )}
 
+        {/* Search input */}
+        <div className="search-container">
+          <input
+            ref={searchInputRef}
+            type="text"
+            className="search-input"
+            placeholder="Search conversations..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+          />
+          {searchQuery && (
+            <button
+              className="search-clear-btn"
+              onClick={() => {
+                setSearchQuery('');
+                searchInputRef.current?.focus();
+              }}
+              title="Clear search"
+            >
+              ×
+            </button>
+          )}
+        </div>
+
         {/* User filter */}
         <div className="user-filter">
           {users.map((user) => (
@@ -180,7 +223,11 @@ export default function Sidebar({
       <div className="conversation-list">
         {filteredConversations.length === 0 ? (
           <div className="no-conversations">
-            {conversations.length === 0 ? 'No conversations yet' : 'No conversations for this user'}
+            {conversations.length === 0
+              ? 'No conversations yet'
+              : searchQuery
+                ? 'No matching conversations'
+                : 'No conversations for this user'}
           </div>
         ) : (
           filteredConversations.map((conv) => (
@@ -208,7 +255,15 @@ export default function Sidebar({
                   </div>
                 )}
                 <div className="conversation-meta">
-                  {conv.message_count} messages{conv.username && ` · ${conv.username}`}
+                  <span className="meta-date">{formatRelativeDate(conv.created_at)}</span>
+                  <span className="meta-separator">·</span>
+                  <span className="meta-count">{conv.message_count} msgs</span>
+                  {conv.username && (
+                    <>
+                      <span className="meta-separator">·</span>
+                      <span className="meta-user">{conv.username}</span>
+                    </>
+                  )}
                 </div>
               </div>
 
@@ -283,6 +338,7 @@ Sidebar.propTypes = {
       title: PropTypes.string,
       message_count: PropTypes.number,
       username: PropTypes.string,
+      created_at: PropTypes.string,
     })
   ).isRequired,
   currentConversationId: PropTypes.string,

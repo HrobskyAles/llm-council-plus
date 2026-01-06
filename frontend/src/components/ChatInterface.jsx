@@ -67,16 +67,19 @@ export default function ChatInterface({
   onUploadFile,
   isLoading,
   webSearchAvailable = false,
+  tavilyEnabled = false,
+  exaEnabled = false,
 }) {
   const [input, setInput] = useState('');
   const [attachments, setAttachments] = useState([]);
   const [isUploading, setIsUploading] = useState(false);
-  const [webSearchEnabled, setWebSearchEnabled] = useState(false);
+  const [webSearchProvider, setWebSearchProvider] = useState('off'); // 'off', 'tavily', 'exa'
   const [driveStatus, setDriveStatus] = useState({ enabled: false, configured: false });
   const [driveUploading, setDriveUploading] = useState({});
   const [driveUploaded, setDriveUploaded] = useState({});
   const messagesEndRef = useRef(null);
   const fileInputRef = useRef(null);
+  const textareaRef = useRef(null);
 
   // Check Google Drive status on mount
   useEffect(() => {
@@ -113,13 +116,26 @@ export default function ChatInterface({
     scrollToBottom();
   }, [conversation]);
 
+  // Auto-resize textarea based on content
+  const adjustTextareaHeight = () => {
+    const textarea = textareaRef.current;
+    if (textarea) {
+      textarea.style.height = 'auto';
+      textarea.style.height = `${Math.min(textarea.scrollHeight, 300)}px`;
+    }
+  };
+
+  useEffect(() => {
+    adjustTextareaHeight();
+  }, [input]);
+
   const handleSubmit = (e) => {
     e.preventDefault();
     if (input.trim() && !isLoading && !isUploading) {
-      onSendMessage(input, attachments.length > 0 ? attachments : null, webSearchEnabled);
+      onSendMessage(input, attachments.length > 0 ? attachments : null, webSearchProvider);
       setInput('');
       setAttachments([]);
-      setWebSearchEnabled(false); // Reset after send
+      // Keep webSearchProvider value for next query
     }
   };
 
@@ -413,6 +429,7 @@ export default function ChatInterface({
             </button>
 
             <textarea
+              ref={textareaRef}
               className="message-input"
               placeholder={conversation.messages.length === 0
                 ? "Ask your question... (Shift+Enter for new line, Enter to send)"
@@ -422,18 +439,22 @@ export default function ChatInterface({
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
               disabled={isLoading || isUploading}
-              rows={3}
+              rows={1}
             />
             {webSearchAvailable && (
-              <label className="web-search-toggle" title="When enabled, queries will include web search for latest news">
-                <input
-                  type="checkbox"
-                  checked={webSearchEnabled}
-                  onChange={(e) => setWebSearchEnabled(e.target.checked)}
+              <div className="web-search-dropdown" title="Select web search provider">
+                <span className="dropdown-icon">🔍</span>
+                <select
+                  value={webSearchProvider}
+                  onChange={(e) => setWebSearchProvider(e.target.value)}
                   disabled={isLoading || isUploading}
-                />
-                <span className="toggle-label">🔍 Web</span>
-              </label>
+                  className="search-provider-select"
+                >
+                  <option value="off">Off</option>
+                  {tavilyEnabled && <option value="tavily">Tavily</option>}
+                  {exaEnabled && <option value="exa">Exa AI</option>}
+                </select>
+              </div>
             )}
             <button
               type="submit"

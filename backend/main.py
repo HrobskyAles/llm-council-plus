@@ -44,7 +44,7 @@ from .council import (
 )
 from .file_parser import parse_file, get_supported_extensions, is_image_file
 from .auth import LoginRequest, authenticate, validate_auth_token, validate_token, get_usernames, validate_jwt_config
-from .config import AUTH_ENABLED
+from .config import AUTH_ENABLED, MIN_CHAIRMAN_CONTEXT
 from .gdrive import upload_to_drive, get_drive_status, is_drive_configured
 from .database import init_database
 
@@ -136,7 +136,8 @@ class SendMessageRequest(BaseModel):
     content: str = Field(min_length=1, max_length=100_000)  # 100KB text limit
     attachments: Optional[List[FileAttachment]] = Field(default=None, max_length=5)  # Max 5 attachments
     temporary: Optional[bool] = False  # If True, don't save to storage (Feature 5)
-    web_search: Optional[bool] = False  # If True, Chairman optimizes query for Tavily search
+    web_search: Optional[bool] = False  # DEPRECATED: use web_search_provider
+    web_search_provider: Optional[str] = Field(default=None, pattern="^(tavily|exa)$")  # 'tavily' or 'exa'
 
     @field_validator('attachments')
     @classmethod
@@ -624,6 +625,18 @@ async def create_conversation(
     current_user: str = Depends(get_current_user)
 ):
     """Create a new conversation. Requires authentication."""
+    # Validate chairman model context length if specified
+    if request.chairman and _models_cache.get("data"):
+        models = _models_cache["data"].get("models", [])
+        chairman_model = next((m for m in models if m["id"] == request.chairman), None)
+        if chairman_model:
+            context_length = chairman_model.get("contextLength", 0)
+            if context_length < MIN_CHAIRMAN_CONTEXT:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Chairman model {request.chairman} has insufficient context length ({context_length}). Minimum required: {MIN_CHAIRMAN_CONTEXT}"
+                )
+
     conversation_id = str(uuid.uuid4())
     # Use authenticated user if not specified in request
     username = request.username or current_user
@@ -959,13 +972,16 @@ async def send_message_stream(
             yield f"data: {json.dumps({'type': 'stage1_start', 'timestamp': stage1_start_time})}\n\n"
 
             images_for_council = image_attachments if image_attachments else None
+            # Determine web search provider (prefer explicit provider, fallback to legacy boolean)
+            web_search_provider = request.web_search_provider or ('tavily' if request.web_search else None)
+
             async for item in stage1_collect_responses_streaming(
                 full_query,
                 conversation_history,
                 conv_models,
                 images_for_council,
                 conversation_id,
-                force_web_search=request.web_search,
+                web_search_provider=web_search_provider,
                 chairman=conv_chairman
             ):
                 # Handle tool_outputs message (first yield if tools were used)
@@ -989,32 +1005,51 @@ async def send_message_stream(
             # Run Stage 2 with periodic heartbeats (CloudFront times out after ~30s without data)
             stage2_task = asyncio.create_task(stage2_collect_rankings(full_query, stage1_results, conv_models))
             heartbeat_interval = 15  # Send heartbeat every 15 seconds
+            heartbeat_count = 0
             while not stage2_task.done():
                 try:
                     # Wait for task to complete OR timeout for heartbeat
                     await asyncio.wait_for(asyncio.shield(stage2_task), timeout=heartbeat_interval)
                 except asyncio.TimeoutError:
                     # Task still running, send heartbeat to keep connection alive
+                    heartbeat_count += 1
+                    logger.info("[STREAMING] Sending Stage 2 heartbeat #%d", heartbeat_count)
                     yield f"data: {json.dumps({'type': 'heartbeat', 'stage': 'stage2', 'timestamp': time.time()})}\n\n"
 
-            stage2_results, label_to_model = stage2_task.result()
+            logger.info("[STREAMING] Stage 2 task finished, getting result...")
+            try:
+                stage2_results, label_to_model = stage2_task.result()
+                logger.info("[STREAMING] Stage 2 got %d results", len(stage2_results))
+            except Exception as task_error:
+                logger.error("[STREAMING] Stage 2 task.result() raised: %s: %s", type(task_error).__name__, task_error)
+                raise
+
             aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
+            logger.info("[STREAMING] Rankings calculated: %d entries", len(aggregate_rankings))
             stage2_end_time = time.time()
             stage2_duration = stage2_end_time - stage2_start_time
+
+            logger.info("[STREAMING] About to yield stage2_complete (%d results)", len(stage2_results))
             yield f"data: {json.dumps({'type': 'stage2_complete', 'data': stage2_results, 'metadata': {'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings}, 'timestamp': stage2_end_time, 'duration': stage2_duration})}\n\n"
+            logger.info("[STREAMING] Stage 2 complete yielded successfully, proceeding to Stage 3")
 
             # Stage 3: Synthesize final answer with heartbeat
             stage3_start_time = time.time()
+            logger.info("[STREAMING] Starting Stage 3")
             yield f"data: {json.dumps({'type': 'stage3_start', 'timestamp': stage3_start_time})}\n\n"
 
             # Run Stage 3 with periodic heartbeats
             stage3_task = asyncio.create_task(stage3_synthesize_final(full_query, stage1_results, stage2_results, conv_chairman, tool_outputs=tool_outputs))
+            heartbeat_count = 0
             while not stage3_task.done():
                 try:
                     await asyncio.wait_for(asyncio.shield(stage3_task), timeout=heartbeat_interval)
                 except asyncio.TimeoutError:
+                    heartbeat_count += 1
+                    logger.info("[STREAMING] Sending Stage 3 heartbeat #%d", heartbeat_count)
                     yield f"data: {json.dumps({'type': 'heartbeat', 'stage': 'stage3', 'timestamp': time.time()})}\n\n"
 
+            logger.info("[STREAMING] Stage 3 completed after %d heartbeats", heartbeat_count)
             stage3_result = stage3_task.result()
             stage3_end_time = time.time()
             stage3_duration = stage3_end_time - stage3_start_time
@@ -1053,11 +1088,22 @@ async def send_message_stream(
         except asyncio.CancelledError:
             # Client disconnected - re-raise to allow proper generator cleanup
             # The finally block below will save partial results
-            logger.info("[STREAMING] Client disconnected during streaming for conversation %s", conversation_id)
+            logger.info("[STREAMING] Client disconnected (CancelledError) during streaming for conversation %s", conversation_id)
+            raise
+        except GeneratorExit:
+            # Generator closed by consumer (client disconnected)
+            # This is the more common case for SSE client disconnection
+            logger.info("[STREAMING] Client disconnected (GeneratorExit) during streaming for conversation %s", conversation_id)
             raise
         except Exception as e:
+            logger.error("[STREAMING] Exception during streaming for conversation %s: %s: %s", conversation_id, type(e).__name__, str(e))
             # Send error event
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+        except BaseException as e:
+            # Catch ALL exceptions including SystemExit, KeyboardInterrupt, etc.
+            # to understand what's causing the generator to stop
+            logger.error("[STREAMING] BaseException during streaming for conversation %s: %s: %s", conversation_id, type(e).__name__, str(e))
+            raise
         finally:
             # CRITICAL FIX: Save partial results if client disconnected before completion
             # This ensures we don't lose work when client closes connection mid-stream

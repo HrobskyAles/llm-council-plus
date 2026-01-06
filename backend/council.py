@@ -102,7 +102,7 @@ from .memory import CouncilMemorySystem
 
 # Import router module based on configuration
 if ROUTER_TYPE == "ollama":
-    from .ollama import query_models_parallel, query_model, query_models_streaming
+    from .ollama import query_models_parallel, query_model, query_models_streaming, query_models_with_stage_timeout
     # Ollama doesn't have build_message_content, provide a fallback
     def build_message_content(text, images=None):
         if images:
@@ -112,7 +112,7 @@ if ROUTER_TYPE == "ollama":
 elif ROUTER_TYPE == "llamacpp":
     from .llamacpp import query_models_parallel, query_model, query_models_streaming, build_message_content
 elif ROUTER_TYPE == "openrouter":
-    from .openrouter import query_models_parallel, query_model, query_models_streaming, build_message_content
+    from .openrouter import query_models_parallel, query_model, query_models_streaming, query_models_with_stage_timeout, build_message_content
 else:
     raise ValueError(f"Invalid ROUTER_TYPE: {ROUTER_TYPE}")
 
@@ -298,31 +298,39 @@ Respond with ONLY the search query, nothing else. No explanations, no quotes, ju
         return user_query
 
 
-def run_tavily_direct(query: str) -> List[Dict[str, str]]:
+def run_tavily_direct(query: str, provider: str = None) -> List[Dict[str, str]]:
     """
     Run web search (Tavily or Exa) directly with the given query.
 
     Args:
         query: The search query to execute
+        provider: Optional provider to use ('tavily' or 'exa'). If not specified,
+                  tries Tavily first, then Exa.
 
     Returns:
         List of tool output dicts with 'tool' and 'result' keys
     """
     tools = get_available_tools()
 
-    # Try Tavily first, then Exa
     tavily_tool = next((t for t in tools if t.name == "tavily_search"), None)
     exa_tool = next((t for t in tools if t.name == "exa_search"), None)
 
-    search_tool = tavily_tool or exa_tool
+    # Select tool based on provider preference
+    if provider == 'exa':
+        search_tool = exa_tool
+    elif provider == 'tavily':
+        search_tool = tavily_tool
+    else:
+        # Default: try Tavily first, then Exa
+        search_tool = tavily_tool or exa_tool
 
     if not search_tool:
-        logger.warning("[WEB_SEARCH] No search tool available (Tavily or Exa)")
+        logger.warning("[WEB_SEARCH] No search tool available for provider=%s", provider or "auto")
         return []
 
     tool_name = search_tool.name
     try:
-        logger.info("[WEB_SEARCH] Executing %s search: %s", tool_name, query[:100])
+        logger.info("[WEB_SEARCH] Executing %s search (provider=%s): %s", tool_name, provider or "auto", query[:100])
         output = search_tool.invoke(query)
         if output:
             try:
@@ -595,7 +603,7 @@ async def stage1_collect_responses_streaming(
     models: List[str] = None,
     images: Optional[List[Dict[str, str]]] = None,
     conversation_id: Optional[str] = None,
-    force_web_search: bool = False,
+    web_search_provider: Optional[str] = None,
     chairman: str = None
 ):
     """
@@ -608,7 +616,7 @@ async def stage1_collect_responses_streaming(
         models: Optional list of model IDs to use (defaults to COUNCIL_MODELS)
         images: Optional list of image attachments for multimodal queries
         conversation_id: Optional conversation ID for memory system
-        force_web_search: If True, Chairman optimizes query and runs Tavily search
+        web_search_provider: Optional search provider ('tavily' or 'exa') to force web search
         chairman: Optional chairman model for search query optimization
 
     Yields:
@@ -620,11 +628,11 @@ async def stage1_collect_responses_streaming(
     # Add tool context
     tool_outputs: List[Dict[str, str]] = []
 
-    # Force web search: Chairman optimizes query, then Tavily searches
-    if force_web_search:
-        logger.info("[STAGE1-STREAM] Force web search enabled, optimizing query with Chairman")
+    # Force web search with specified provider
+    if web_search_provider:
+        logger.info("[STAGE1-STREAM] Web search enabled (provider=%s), optimizing query with Chairman", web_search_provider)
         optimized_query = await optimize_search_query(user_query, chairman)
-        tool_outputs = run_tavily_direct(optimized_query)
+        tool_outputs = run_tavily_direct(optimized_query, provider=web_search_provider)
         logger.info("[STAGE1-STREAM] Web search returned %d results", len(tool_outputs))
     # Regular tool detection (Feature 4)
     elif requires_tools(user_query):
@@ -797,8 +805,15 @@ Now provide your evaluation and ranking:"""
     logger.debug("[STAGE2] Evaluating %d valid responses", len(valid_stage1))
     logger.debug("[STAGE2] Using %d models from Stage 1 successes: %s", len(council_models), council_models)
 
-    # Get rankings from models in parallel
-    responses = await query_models_parallel(council_models, messages, stage="STAGE2")
+    # Get rankings from models with stage-level timeout
+    # Uses first-N-complete pattern: proceeds after 90s if at least 3 models responded
+    responses = await query_models_with_stage_timeout(
+        council_models,
+        messages,
+        stage="STAGE2",
+        stage_timeout=90.0,  # 90 seconds max for Stage 2
+        min_results=min(3, len(council_models))  # Need at least 3 or all if less
+    )
 
     # Format results - include both successes and errors
     stage2_results = []
@@ -963,9 +978,13 @@ Provide a clear, well-reasoned final answer that represents the council's collec
     # Query the chairman model
     response = await query_model(chairman_model, messages, stage="STAGE3")
 
-    if response is None:
+    # Check if response failed (None or error response)
+    response_failed = response is None or response.get('error')
+    if response_failed:
+        error_reason = response.get('error_message', 'No response') if response else 'No response'
         # Try fallback: use models from Stage 1 as chairman (try each until one works)
-        logger.warning("Chairman model %s failed. Attempting fallback with preset models...", chairman_model)
+        logger.warning("Chairman model %s failed (%s). Attempting fallback with preset models...",
+                      chairman_model, error_reason)
 
         # Collect all Stage 1 models (excluding chairman if it was in the list)
         fallback_models = [
@@ -978,7 +997,8 @@ Provide a clear, well-reasoned final answer that represents the council's collec
                        fallback_model, len(fallback_models) - fallback_models.index(fallback_model) - 1)
             fallback_response = await query_model(fallback_model, messages, stage="STAGE3_FALLBACK")
 
-            if fallback_response is not None and fallback_response.get('content'):
+            # Check if fallback succeeded (not None and not error)
+            if fallback_response and not fallback_response.get('error') and fallback_response.get('content'):
                 logger.info("Fallback successful with model %s", fallback_model)
                 return {
                     "model": fallback_model,
@@ -987,7 +1007,8 @@ Provide a clear, well-reasoned final answer that represents the council's collec
                     "original_chairman": chairman_model
                 }
             else:
-                logger.warning("Fallback model %s also failed, trying next...", fallback_model)
+                fail_reason = fallback_response.get('error_message') if fallback_response else 'No response'
+                logger.warning("Fallback model %s also failed (%s), trying next...", fallback_model, fail_reason)
 
         # All fallbacks failed, return error with context
         error_msg = (
@@ -1063,7 +1084,13 @@ def calculate_aggregate_rankings(
     model_positions = defaultdict(list)
 
     for ranking in stage2_results:
-        ranking_text = ranking['ranking']
+        # Skip error results - they don't have ranking data
+        if ranking.get('error'):
+            continue
+
+        ranking_text = ranking.get('ranking')
+        if not ranking_text:
+            continue
 
         # Parse the ranking from the structured format
         parsed_ranking = parse_ranking_from_text(ranking_text)

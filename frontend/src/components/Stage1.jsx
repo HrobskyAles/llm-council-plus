@@ -11,6 +11,7 @@ const ERROR_MESSAGES = {
   not_found: 'Model not available',
   auth: 'Authentication error',
   timeout: 'Request timed out',
+  stage_timeout: 'Stage timeout - model too slow',
   connection: 'Connection error',
   empty: 'Empty response',
   unknown: 'Unknown error',

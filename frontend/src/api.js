@@ -257,15 +257,16 @@ export const api = {
    * @param {string} content - The message content
    * @param {function} onEvent - Callback function for each event: (eventType, data) => void
    * @param {Array} attachments - Optional array of file attachments
+   * @param {string} webSearchProvider - Web search provider: 'off', 'tavily', or 'exa'
    * @returns {Promise<void>}
    */
-  async sendMessageStream(conversationId, content, onEvent, attachments = null, webSearch = false) {
+  async sendMessageStream(conversationId, content, onEvent, attachments = null, webSearchProvider = 'off') {
     const body = { content };
     if (attachments && attachments.length > 0) {
       body.attachments = attachments;
     }
-    if (webSearch) {
-      body.web_search = true;
+    if (webSearchProvider && webSearchProvider !== 'off') {
+      body.web_search_provider = webSearchProvider;
     }
 
     const response = await authFetch(

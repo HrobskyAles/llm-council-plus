@@ -1,9 +1,10 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import Sidebar from './components/Sidebar';
 import ChatInterface from './components/ChatInterface';
 import ModelSelector from './components/ModelSelector';
 import LoginScreen from './components/LoginScreen';
 import SetupWizard from './components/SetupWizard';
+import { ToastContainer } from './components/Toast';
 import { useAuthStore } from './store/authStore';
 import { api } from './api';
 import { exportToMarkdown, generateFilename } from './utils/exportMarkdown';
@@ -21,7 +22,11 @@ function App() {
   const [setupRequired, setSetupRequired] = useState(false);
   const [setupChecked, setSetupChecked] = useState(false);
   const [webSearchAvailable, setWebSearchAvailable] = useState(false);
+  const [tavilyEnabled, setTavilyEnabled] = useState(false);
+  const [exaEnabled, setExaEnabled] = useState(false);
+  const [toasts, setToasts] = useState([]);
   const pendingMessageRef = useRef(null);
+  const toastIdRef = useRef(0);
 
   // Store streaming state per conversation to preserve intermediate results
   const streamingStateRef = useRef(new Map()); // Map<conversationId, {messages, isLoading}>
@@ -31,37 +36,43 @@ function App() {
   const currentConversationIdRef = useRef(null);
 
   // Helper to update streaming conversation state (handles case when user switched away)
+  // FIX: Make ref the single source of truth, then sync React state from ref
   const updateStreamingState = (updater) => {
     const streamingConvId = activeStreamingConvIdRef.current;
     if (!streamingConvId) return;
 
-    // If we're still on the streaming conversation, update currentConversation
+    // ALWAYS update the ref first (single source of truth)
+    const storedState = streamingStateRef.current.get(streamingConvId);
+    if (!storedState) return;
+
+    const fakeConv = { messages: storedState.messages };
+    const updated = updater(fakeConv);
+    const newMessages = updated.messages;
+
+    streamingStateRef.current.set(streamingConvId, {
+      ...storedState,
+      messages: newMessages
+    });
+
+    // If we're still on the streaming conversation, sync React state from ref
     if (streamingConvId === currentConversationIdRef.current) {
-      setCurrentConversation(updater);
-      // Also update stored state so it's in sync
-      const storedState = streamingStateRef.current.get(streamingConvId);
-      if (storedState) {
-        const fakeConv = { messages: storedState.messages };
-        const updated = updater(fakeConv);
-        streamingStateRef.current.set(streamingConvId, {
-          ...storedState,
-          messages: updated.messages
-        });
-      }
-    } else {
-      // User switched away - update only the stored streaming state
-      const storedState = streamingStateRef.current.get(streamingConvId);
-      if (storedState) {
-        // Apply the updater to create new messages
-        const fakeConv = { messages: storedState.messages };
-        const updated = updater(fakeConv);
-        streamingStateRef.current.set(streamingConvId, {
-          ...storedState,
-          messages: updated.messages
-        });
-      }
+      // Use functional update but read from ref to ensure consistency
+      setCurrentConversation((prev) => ({
+        ...prev,
+        messages: newMessages
+      }));
     }
   };
+
+  // Toast notification helpers
+  const addToast = useCallback((message, type = 'error', duration = 6000) => {
+    const id = ++toastIdRef.current;
+    setToasts((prev) => [...prev, { id, message, type, duration }]);
+  }, []);
+
+  const removeToast = useCallback((id) => {
+    setToasts((prev) => prev.filter((t) => t.id !== id));
+  }, []);
 
   // Auth state
   const { isSessionValid, login, username } = useAuthStore();
@@ -70,9 +81,11 @@ function App() {
   // Check setup status first - if API key is missing, show wizard
   useEffect(() => {
     api.getSetupStatus()
-      .then(({ setup_required, web_search_enabled }) => {
+      .then(({ setup_required, web_search_enabled, tavily_enabled, exa_enabled }) => {
         setSetupRequired(setup_required);
         setWebSearchAvailable(web_search_enabled || false);
+        setTavilyEnabled(tavily_enabled || false);
+        setExaEnabled(exa_enabled || false);
         setSetupChecked(true);
       })
       .catch((err) => {
@@ -245,7 +258,7 @@ function App() {
     }
   };
 
-  const handleSendMessage = async (content, attachments = null, webSearch = false) => {
+  const handleSendMessage = async (content, attachments = null, webSearchProvider = 'off') => {
     if (!currentConversationId) return;
 
     setIsLoading(true);
@@ -318,6 +331,20 @@ function App() {
 
           case 'stage1_model_response':
             // Add individual model response to stage1 array as it arrives
+            // Show toast notification for errors (timeout, rate limit, etc.)
+            if (event.data.error) {
+              const modelName = event.data.model.split('/')[1] || event.data.model;
+              const errorType = event.data.error_type || 'unknown';
+              const errorMessages = {
+                timeout: `${modelName}: Request timed out`,
+                stage_timeout: `${modelName}: Stage timeout (too slow)`,
+                rate_limit: `${modelName}: Rate limited`,
+                auth: `${modelName}: Authentication error`,
+                connection: `${modelName}: Connection error`,
+                empty: `${modelName}: Empty response`,
+              };
+              addToast(errorMessages[errorType] || `${modelName}: ${event.data.error_message || 'Error'}`, 'warning');
+            }
             updateStreamingState((prev) => {
               const lastIdx = prev.messages.length - 1;
               const lastMsg = prev.messages[lastIdx];
@@ -499,6 +526,7 @@ function App() {
 
           case 'error': {
             console.error('Stream error:', event.message);
+            addToast(`Stream error: ${event.message || 'Unknown error'}`, 'error');
             // Clear streaming state on error
             const streamingConvId = activeStreamingConvIdRef.current;
             if (streamingConvId) {
@@ -512,7 +540,7 @@ function App() {
           default:
             console.log('Unknown event type:', eventType);
         }
-      }, attachments, webSearch);
+      }, attachments, webSearchProvider);
     } catch (error) {
       console.error('Failed to send message:', error);
       // Remove optimistic messages on error
@@ -569,12 +597,15 @@ function App() {
         onUploadFile={api.uploadFile}
         isLoading={isLoading}
         webSearchAvailable={webSearchAvailable}
+        tavilyEnabled={tavilyEnabled}
+        exaEnabled={exaEnabled}
       />
       <ModelSelector
         isOpen={showModelSelector}
         onClose={() => setShowModelSelector(false)}
         onConfirm={handleModelSelectionConfirm}
       />
+      <ToastContainer toasts={toasts} onRemove={removeToast} />
     </div>
   );
 }
